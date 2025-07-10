@@ -6,9 +6,9 @@ from dateutil.relativedelta import relativedelta
 # Load the gold transactions table
 gold = spark.table("gold.transactions")
 
-# Define dimensions
+# Define dimensions (excluding "Country" itself)
 dimensions = [
-    "Country", "SubscriptionTerm", "PaymentMethodFamily", "PaymentMethodType", "BinCardType",
+    "SubscriptionTerm", "PaymentMethodFamily", "PaymentMethodType", "BinCardType",
     "IssuerName", "BIN", "MerchantId", "ProviderName", "BincardProduct", "SubscriptionAge"
 ]
 
@@ -42,14 +42,8 @@ final_df = pd.DataFrame()
 
 for dim in dimensions:
     print(f"Processing dimension: {dim}")
-
-    # Setup grouping/index columns
-    if dim == "Country":
-        group_fields = ["Country"]
-        index_cols = ["Country"]
-    else:
-        group_fields = ["Country", dim]
-        index_cols = ["Country", dim]
+    group_fields = ["Country", dim]
+    index_cols = ["Country", dim]
 
     df_monthly = (
         filtered.withColumn("month", F.date_format("DunningFirstAttemptDate", "MMM-yyyy"))
@@ -63,12 +57,13 @@ for dim in dimensions:
     df = df_monthly.toPandas()
     df = df[df['month'].isin(month_filter)]
 
-    # Skip if no data
-    if df.empty or (dim != "Country" and df[dim].isnull().all()):
+    # SKIP if no data
+    if df.empty or df[dim].isnull().all() or df['Country'].isnull().all():
         continue
 
     df['approval_rate'] = df['approved_txns'] / df['total_txns']
 
+    # Pivot the table
     df_m = df.pivot_table(
         index=index_cols,
         columns='month',
@@ -76,16 +71,20 @@ for dim in dimensions:
         fill_value=0
     ).reset_index()
 
-    # Flatten columns
-    df_m.columns = ['_'.join(col) if isinstance(col, tuple) else col for col in df_m.columns]
+    # Flatten columns for easy access
+    df_m.columns = [
+        '_'.join([str(x) for x in col if x]) if isinstance(col, tuple) else col
+        for col in df_m.columns
+    ]
 
-    # Ensure missing columns are created for concat compatibility
+    # Ensure columns exist for both months
     for metric in ['approved_txns', 'total_txns', 'approval_rate']:
         for label in [prev_month_label, month_label]:
             col_name = f"{metric}_{label}"
             if col_name not in df_m.columns:
                 df_m[col_name] = 0
 
+    # All required calculations
     df_m['approval_rate_diff'] = (
         df_m[f'approval_rate_{month_label}'] - df_m[f'approval_rate_{prev_month_label}']
     )
@@ -104,10 +103,8 @@ for dim in dimensions:
 
     # Assign dimension name and value
     df_m["dimension_name"] = dim
-    if dim == "Country":
-        df_m['dimension_value'] = df_m["Country"]
-    else:
-        df_m['dimension_value'] = df_m[dim]
+    df_m["dimension_value"] = df_m[dim] if dim in df_m.columns else None
+    df_m["Country"] = df_m["Country"]
 
     df_m['month'] = current_month.strftime("%b")
     df_m['current_year'] = current_month.year
@@ -125,6 +122,7 @@ for dim in dimensions:
         inplace=True
     )
 
+    # Ensure all columns are numeric as needed
     for col in [
         "approved_txns_last_year", "approved_txns_current_year", "total_txns_last_year",
         "total_txns_current_year", "approval_rate_last_year", "approval_rate_current_year",
@@ -147,7 +145,9 @@ for dim in dimensions:
     df_m['percent_contribution'] = df_m['Additional_approve'] - approval_rate_current_month_avg
 
     total_txn_share = df_m['txn_share_current'].sum()
-    df_m['Share_Pmt_Total'] = 100 * (df_m['txn_share_current'] / total_txn_share) if total_txn_share != 0 else 0
+    df_m['Share_Pmt_Total'] = (
+        100 * (df_m['txn_share_current'] / total_txn_share) if total_txn_share != 0 else 0
+    )
 
     df_m['Performance Effect'] = df_m['approval_rate_diff'] * (
         (df_m['txn_share_last'] + df_m['txn_share_current']) / 2
@@ -161,9 +161,9 @@ for dim in dimensions:
 
     df_m['SubscriptionTerm'] = '1-Month'
 
-    # Always set columns in same order for concatenation
+    # Set column order for final output
     output_cols = [
-        'dimension_name', 'dimension_value', 'Country', 'month', 'current_year', 'previous_year',
+        'Country', 'dimension_name', 'dimension_value', 'month', 'current_year', 'previous_year',
         'approved_txns_last_year', 'approved_txns_current_year', 'total_txns_last_year',
         'total_txns_current_year', 'approval_rate_last_year', 'approval_rate_current_year',
         'approval_rate_diff', "txn_share_last", 'txn_share_current', 'impact_score',
