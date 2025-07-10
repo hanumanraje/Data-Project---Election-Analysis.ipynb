@@ -1,0 +1,181 @@
+from pyspark.sql import functions as F
+import pandas as pd
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+
+# Load the gold transactions table
+gold = spark.table("gold.transactions")
+
+# Define dimensions
+dimensions = [
+    "Country", "SubscriptionTerm", "PaymentMethodFamily", "PaymentMethodType", "BinCardType",
+    "IssuerName", "BIN", "MerchantId", "ProviderName", "BincardProduct", "SubscriptionAge"
+]
+
+# Set current and previous year months
+today = datetime.today()
+current_month = today.replace(day=1) - relativedelta(months=2)
+current_month = current_month.replace(day=1)
+previous_year_month = current_month.replace(year=current_month.year - 1)
+
+month_label = current_month.strftime("%b-%Y")
+prev_month_label = previous_year_month.strftime("%b-%Y")
+month_filter = [month_label, prev_month_label]
+
+# Apply filters
+filtered = gold.filter(
+    (F.col("DunningFirstAttemptDate").isNotNull()) &
+    (F.col("DunningFirstAttemptDate").between('2023-01-01', today.strftime('%Y-%m-%d'))) &
+    (F.col("productGroup") == 'M365 Consumer') &
+    (F.col("IsAuthTerminalState") == "true") &
+    (~F.col("ProviderName").like('Stored Value')) &
+    ((F.col("CustomerOrMerchantInitiated") == 'MerchantInitiated') | (F.col("IsPayNow") == "true")) &
+    (F.col("ConsumerOrCommercial") == 'Consumer') &
+    ((F.col("IsLatestDunAttemptByCycle") == "true") | F.col("DunAttemptByCycle").isNull()) &
+    ((F.col("IsLastDynamicRetry") == "true") | F.col("IsLastDynamicRetry").isNull()) &
+    (F.col("IsTransactionAbandoned") == "false") &
+    (F.col("ProductDivision") == 'M365 Consumer') &
+    (F.col("SubscriptionTerm") == '1-Month')
+)
+
+final_df = pd.DataFrame()
+
+for dim in dimensions:
+    print(f"Processing dimension: {dim}")
+
+    # Setup grouping/index columns
+    if dim == "Country":
+        group_fields = ["Country"]
+        index_cols = ["Country"]
+    else:
+        group_fields = ["Country", dim]
+        index_cols = ["Country", dim]
+
+    df_monthly = (
+        filtered.withColumn("month", F.date_format("DunningFirstAttemptDate", "MMM-yyyy"))
+        .groupBy(group_fields + ["month"])
+        .agg(
+            F.sum(F.when(F.col("TransactionStatus") == "APPROVED", 1).otherwise(0)).alias("approved_txns"),
+            F.count("*").alias("total_txns")
+        )
+    )
+
+    df = df_monthly.toPandas()
+    df = df[df['month'].isin(month_filter)]
+
+    # Skip if no data
+    if df.empty or (dim != "Country" and df[dim].isnull().all()):
+        continue
+
+    df['approval_rate'] = df['approved_txns'] / df['total_txns']
+
+    df_m = df.pivot_table(
+        index=index_cols,
+        columns='month',
+        values=['approved_txns', 'total_txns', 'approval_rate'],
+        fill_value=0
+    ).reset_index()
+
+    # Flatten columns
+    df_m.columns = ['_'.join(col) if isinstance(col, tuple) else col for col in df_m.columns]
+
+    # Ensure missing columns are created for concat compatibility
+    for metric in ['approved_txns', 'total_txns', 'approval_rate']:
+        for label in [prev_month_label, month_label]:
+            col_name = f"{metric}_{label}"
+            if col_name not in df_m.columns:
+                df_m[col_name] = 0
+
+    df_m['approval_rate_diff'] = (
+        df_m[f'approval_rate_{month_label}'] - df_m[f'approval_rate_{prev_month_label}']
+    )
+
+    total_txns_last = df_m[f"total_txns_{prev_month_label}"].sum()
+    df_m['txn_share_last'] = (
+        df_m[f"total_txns_{prev_month_label}"] / total_txns_last if total_txns_last != 0 else 0
+    )
+
+    total_txns_current = df_m[f"total_txns_{month_label}"].sum()
+    df_m['txn_share_current'] = (
+        df_m[f"total_txns_{month_label}"] / total_txns_current if total_txns_current != 0 else 0
+    )
+
+    df_m['impact_score'] = df_m["txn_share_current"] * df_m["approval_rate_diff"]
+
+    # Assign dimension name and value
+    df_m["dimension_name"] = dim
+    if dim == "Country":
+        df_m['dimension_value'] = df_m["Country"]
+    else:
+        df_m['dimension_value'] = df_m[dim]
+
+    df_m['month'] = current_month.strftime("%b")
+    df_m['current_year'] = current_month.year
+    df_m['previous_year'] = previous_year_month.year
+
+    df_m.rename(
+        columns={
+            f"approved_txns_{prev_month_label}": "approved_txns_last_year",
+            f"approved_txns_{month_label}": "approved_txns_current_year",
+            f"total_txns_{prev_month_label}": "total_txns_last_year",
+            f"total_txns_{month_label}": "total_txns_current_year",
+            f"approval_rate_{prev_month_label}": "approval_rate_last_year",
+            f"approval_rate_{month_label}": "approval_rate_current_year"
+        },
+        inplace=True
+    )
+
+    for col in [
+        "approved_txns_last_year", "approved_txns_current_year", "total_txns_last_year",
+        "total_txns_current_year", "approval_rate_last_year", "approval_rate_current_year",
+        "approval_rate_diff", "txn_share_last", "txn_share_current", "impact_score"
+    ]:
+        df_m[col] = pd.to_numeric(df_m[col], errors='coerce').fillna(0)
+
+    df_m["txtn"] = df_m["approval_rate_last_year"] * df_m["total_txns_current_year"]
+    df_m["txtn"] = df_m["txtn"] - df_m["approved_txns_current_year"]
+
+    Approved_transection_current_sum = df_m["approved_txns_current_year"].sum()
+    Total_transection_current_sum = df_m["total_txns_current_year"].sum()
+
+    df_m['Additional_approve'] = (
+        (df_m["txtn"] + Approved_transection_current_sum) / Total_transection_current_sum
+        if Total_transection_current_sum != 0 else 0
+    )
+
+    approval_rate_current_month_avg = df_m["approval_rate_current_year"].mean()
+    df_m['percent_contribution'] = df_m['Additional_approve'] - approval_rate_current_month_avg
+
+    total_txn_share = df_m['txn_share_current'].sum()
+    df_m['Share_Pmt_Total'] = 100 * (df_m['txn_share_current'] / total_txn_share) if total_txn_share != 0 else 0
+
+    df_m['Performance Effect'] = df_m['approval_rate_diff'] * (
+        (df_m['txn_share_last'] + df_m['txn_share_current']) / 2
+    )
+
+    df_m['txn_share_diff'] = df_m['txn_share_current'] - df_m['txn_share_last']
+    df_m['Mix Effect'] = df_m['txn_share_diff'] * (
+        (df_m['approval_rate_current_year'] + df_m['approval_rate_last_year']) / 2
+    )
+    df_m['contribution'] = df_m['Performance Effect'] + df_m['Mix Effect']
+
+    df_m['SubscriptionTerm'] = '1-Month'
+
+    # Always set columns in same order for concatenation
+    output_cols = [
+        'dimension_name', 'dimension_value', 'Country', 'month', 'current_year', 'previous_year',
+        'approved_txns_last_year', 'approved_txns_current_year', 'total_txns_last_year',
+        'total_txns_current_year', 'approval_rate_last_year', 'approval_rate_current_year',
+        'approval_rate_diff', "txn_share_last", 'txn_share_current', 'impact_score',
+        'Additional_approve', 'percent_contribution', 'txtn', 'txn_share_diff',
+        'Share_Pmt_Total', 'Performance Effect', 'Mix Effect', 'contribution', 'SubscriptionTerm'
+    ]
+    for col in output_cols:
+        if col not in df_m.columns:
+            df_m[col] = 0
+
+    final_df = pd.concat([final_df, df_m[output_cols]], ignore_index=True)
+
+# Final sorting and export
+final_df = final_df.sort_values(['dimension_name', 'percent_contribution'], ascending=[True, False])
+final_df.to_excel("july10_yearly_country_dim.xlsx", index=False)
